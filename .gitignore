@@ -1,0 +1,41 @@
+# PlatformIO
+.pio/
+.cmake-build*/
+.ccls-cache/
+.cache/
+.clangd
+clangd/
+CMakeFiles/
+cmake-build-*/
+build/
+
+# VSCode
+.vscode/
+*.code-workspace
+
+# JetBrains
+.idea/
+
+# macOS
+.DS_Store
+
+# Python/venv (если используете скрипты)
+.venv/
+env/
+venv/
+__pycache__/
+
+# Node (если вдруг добавите tooling)
+node_modules/
+
+# Бинарники прошивок и артефакты
+*.bin
+*.elf
+*.map
+
+# Локальные конфиги/секреты
+src/secrets.h
+data/config.json
+config.json
+
+compile_commands.json
