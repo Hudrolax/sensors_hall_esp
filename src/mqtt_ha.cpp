@@ -2,10 +2,21 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <ESP8266WiFi.h>
+#include <PubSubClient.h>
 
+// Ожидается, что в mqtt_ha.h объявлены:
+//   namespace mqtt_ha {
+//     using GuardChangeCb = void(*)(bool);
+//     void begin(PubSubClient& mqtt, AppConfig& cfg, const String& client_name, GuardChangeCb cb);
+//     bool ensureMqtt(bool ap_mode);
+//     void publishFast(bool motion, bool button, int light);
+//     void publishTemp(double tC);
+//   }
+
+// ======= Внутреннее состояние =======
 static PubSubClient* s_mqtt = nullptr;
-static AppConfig* s_cfg = nullptr;
-static String s_client_name;
+static AppConfig*     s_cfg = nullptr;
+static String         s_client_name;
 static mqtt_ha::GuardChangeCb s_guard_cb = nullptr;
 
 // Топики данных
@@ -14,22 +25,22 @@ static String t_status, t_motion, t_button, t_light, t_temp, t_guard_state, t_gu
 static String d_motion, d_button, d_light, d_temp, d_guard;
 
 // Состояние
-static bool  s_connected_session = false;   // новый MQTT-сессия после connect
-static bool  s_guard = false;               // текущее состояние сторожа
+static bool   s_connected_session = false;   // true сразу после успешного connect()
+static bool   s_guard = false;               // режим "охраны" (управляется из MQTT)
 
-// Последние опубликованные значения (для "publish-on-change")
-static int   s_last_motion = 2;             // 2 = неинициализировано (булево)
-static int   s_last_button = 2;             // 2 = неинициализировано (булево)
-static int   s_last_light  = -32768;        // "очень давно" для аналога
-static double s_last_temp  = NAN;
+// Последние опубликованные значения (для publish-on-change)
+static int    s_last_motion = 2;             // 2 => неинициализировано (булево)
+static int    s_last_button = 2;             // 2 => неинициализировано (булево)
+static int    s_last_light  = -32768;        // "очень давно" для аналога
+static double s_last_temp   = NAN;
 static unsigned long s_last_temp_pub_ms = 0;
 
-// Порог для аналога и температуры
-static const int    LIGHT_DELTA = 5;        // публиковать, если |Δ| >= 5
-static const double TEMP_DELTA  = 0.2;      // публиковать, если |Δ| >= 0.2 °C
-static const unsigned long TEMP_MAX_AGE_MS = 5UL * 60UL * 1000UL; // или раз в 5 минут
+// Порог/тайминги публикаций
+static const int           LIGHT_DELTA      = 5;     // ед.
+static const double        TEMP_DELTA       = 0.2;   // °C
+static const unsigned long TEMP_MAX_AGE_MS  = 300000; // 5 минут
 
-// ------------------------ helpers ------------------------
+// ======= Хелперы =======
 static String chipId() {
   char buf[10];
   snprintf(buf, sizeof(buf), "%06X", ESP.getChipId());
@@ -56,6 +67,14 @@ static void ensureTopics() {
   d_guard  = "homeassistant/switch/"        + node + "/guard/config";
 }
 
+static void addDeviceBlock(StaticJsonDocument<512>& d) {
+  JsonObject device = d.createNestedObject("device");
+  device["identifiers"]  = s_client_name + "_" + chipId();
+  device["manufacturer"] = "DIY";
+  device["model"]        = "ESP8266 Sensor";
+  device["name"]         = s_client_name;
+}
+
 static void publishDiscoveryOne(const String& topic, std::function<void(StaticJsonDocument<512>&)> fill) {
   StaticJsonDocument<512> d;
   fill(d);
@@ -67,80 +86,71 @@ static void publishDiscoveryOne(const String& topic, std::function<void(StaticJs
   }
 }
 
-// Корректный блок device для HA discovery
-static void addDeviceBlock(StaticJsonDocument<512>& d) {
-  JsonObject device = d.createNestedObject("device");
-  device["identifiers"]  = "esp8266_" + chipId();
-  device["manufacturer"] = "Custom";
-  device["model"]        = "ESP8266 Sensor";
-  device["name"]         = s_client_name;
-}
-
 static void publishDiscovery() {
   // Motion binary_sensor
   publishDiscoveryOne(d_motion, [](StaticJsonDocument<512>& d){
-    d["name"]                 = s_client_name + " Motion";
-    d["unique_id"]            = s_client_name + "_" + chipId() + "_motion";
-    d["state_topic"]          = t_motion;
-    d["device_class"]         = "motion";
-    d["payload_on"]           = "ON";
-    d["payload_off"]          = "OFF";
-    d["availability_topic"]   = t_status;
+    d["name"]               = s_client_name + " Motion";
+    d["unique_id"]          = s_client_name + "_" + chipId() + "_motion";
+    d["state_topic"]        = t_motion;
+    d["device_class"]       = "motion";
+    d["payload_on"]         = "ON";
+    d["payload_off"]        = "OFF";
+    d["availability_topic"] = t_status;
     addDeviceBlock(d);
   });
 
   // Button binary_sensor
   publishDiscoveryOne(d_button, [](StaticJsonDocument<512>& d){
-    d["name"]                 = s_client_name + " Button";
-    d["unique_id"]            = s_client_name + "_" + chipId() + "_button";
-    d["state_topic"]          = t_button;
-    d["payload_on"]           = "ON";
-    d["payload_off"]          = "OFF";
-    d["availability_topic"]   = t_status;
+    d["name"]               = s_client_name + " Button";
+    d["unique_id"]          = s_client_name + "_" + chipId() + "_button";
+    d["state_topic"]        = t_button;
+    d["payload_on"]         = "ON";
+    d["payload_off"]        = "OFF";
+    d["availability_topic"] = t_status;
     addDeviceBlock(d);
   });
 
-  // Light sensor (ADC)
+  // Light sensor
   publishDiscoveryOne(d_light, [](StaticJsonDocument<512>& d){
-    d["name"]                 = s_client_name + " Light";
-    d["unique_id"]            = s_client_name + "_" + chipId() + "_light";
-    d["state_topic"]          = t_light;
-    d["unit_of_measurement"]  = "adc";
-    d["state_class"]          = "measurement";
-    d["availability_topic"]   = t_status;
+    d["name"]               = s_client_name + " Light";
+    d["unique_id"]          = s_client_name + "_" + chipId() + "_light";
+    d["state_topic"]        = t_light;
+    d["device_class"]       = "illuminance";
+    d["unit_of_measurement"]= "lx";
+    d["state_class"]        = "measurement";
+    d["availability_topic"] = t_status;
     addDeviceBlock(d);
   });
 
   // Temperature sensor
   publishDiscoveryOne(d_temp, [](StaticJsonDocument<512>& d){
-    d["name"]                 = s_client_name + " Temperature";
-    d["unique_id"]            = s_client_name + "_" + chipId() + "_temperature";
-    d["state_topic"]          = t_temp;
-    d["device_class"]         = "temperature";
-    d["unit_of_measurement"]  = "°C";
-    d["state_class"]          = "measurement";
-    d["availability_topic"]   = t_status;
+    d["name"]               = s_client_name + " Temperature";
+    d["unique_id"]          = s_client_name + "_" + chipId() + "_temperature";
+    d["state_topic"]        = t_temp;
+    d["device_class"]       = "temperature";
+    d["unit_of_measurement"]= "°C";
+    d["state_class"]        = "measurement";
+    d["availability_topic"] = t_status;
     addDeviceBlock(d);
   });
 
   // Guard switch
   publishDiscoveryOne(d_guard, [](StaticJsonDocument<512>& d){
-    d["name"]                 = s_client_name + " Guard Mode";
-    d["unique_id"]            = s_client_name + "_" + chipId() + "_guard";
-    d["command_topic"]        = t_guard_set;
-    d["state_topic"]          = t_guard_state;
-    d["payload_on"]           = "ON";
-    d["payload_off"]          = "OFF";
-    d["availability_topic"]   = t_status;
+    d["name"]               = s_client_name + " Guard Mode";
+    d["unique_id"]          = s_client_name + "_" + chipId() + "_guard";
+    d["command_topic"]      = t_guard_set;
+    d["state_topic"]        = t_guard_state;
+    d["payload_on"]         = "ON";
+    d["payload_off"]        = "OFF";
+    d["availability_topic"] = t_status;
     addDeviceBlock(d);
   });
 }
 
-// ------------------------ onMessage ------------------------
 static void onMessage(char* topic, byte* payload, unsigned int length) {
-  String t = topic;
+  String t(topic);
   String msg; msg.reserve(length);
-  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+  for (unsigned int i = 0; i < length; ++i) msg += (char)payload[i];
 
   if (t == t_guard_set) {
     bool new_state = (msg == "ON");
@@ -148,13 +158,13 @@ static void onMessage(char* topic, byte* payload, unsigned int length) {
       s_guard = new_state;
       if (s_guard_cb) s_guard_cb(s_guard);
     }
-    s_mqtt->publish(t_guard_state.c_str(), s_guard ? "ON" : "OFF", true); // retain
+    if (s_mqtt && s_mqtt->connected()) {
+      s_mqtt->publish(t_guard_state.c_str(), s_guard ? "ON" : "OFF", true);
+    }
   }
 }
 
-// ============================================================
-//                       PUBLIC  API
-// ============================================================
+// ===================== PUBLIC API =====================
 namespace mqtt_ha {
 
 void begin(PubSubClient& mqtt, AppConfig& cfg, const String& client_name, GuardChangeCb cb) {
@@ -168,9 +178,9 @@ void begin(PubSubClient& mqtt, AppConfig& cfg, const String& client_name, GuardC
   ensureTopics();
 }
 
-// >>> меняем сигнатуру и поведение:
-bool ensureMqtt(bool ap_mode) {
-  if (ap_mode || WiFi.status() != WL_CONNECTED || !s_mqtt) return false;
+// ВАЖНО: наличие AP не блокирует MQTT. Смотрим только на STA-онлайн.
+bool ensureMqtt(bool /*ap_mode_ignored*/) {
+  if (WiFi.status() != WL_CONNECTED || !s_mqtt) return false;
   if (s_mqtt->connected()) return false;
 
   String cid = s_cfg->client_id.length() ? s_cfg->client_id : (s_client_name + "-" + chipId());
@@ -183,28 +193,31 @@ bool ensureMqtt(bool ap_mode) {
         t_status.c_str(), 0, true, "offline"   // LWT retained
       )) {
 
+    // Отметим наличие
     s_mqtt->publish(t_status.c_str(), "online", true);  // retained
 
     publishDiscovery();                 // retained
     s_mqtt->subscribe(t_guard_set.c_str());
     s_mqtt->publish(t_guard_state.c_str(), s_guard ? "ON" : "OFF", true);  // retained
 
-    // Помечаем, что началась новая сессия — чтобы публикации «по изменению» точно пошли
+    // Помечаем, что началась новая сессия — чтобы первичная публикация ушла в publishFast/Temp
     s_connected_session = true;
+
+    // Сбрасываем кеш значений «последний раз публиковалось»
     s_last_motion = 2;
     s_last_button = 2;
     s_last_light  = -32768;
     s_last_temp   = NAN;
     s_last_temp_pub_ms = 0;
 
-    return true;   // <<< сообщаем main, что подключились прямо сейчас
+    return true;
   }
   return false;
 }
 
-// Публикации только при изменении, НО теперь с retain=true
+// Пакет «быстрых» значений: движение/кнопка/освещённость
 void publishFast(bool motion, bool button, int light) {
-  if (!s_mqtt || !s_mqtt->connected()) return;
+  if (!s_mqtt || !s_mqtt->connected()) { s_connected_session = false; return; }
 
   if (s_connected_session || s_last_motion == 2 || (int)motion != s_last_motion) {
     s_mqtt->publish(t_motion.c_str(), motion ? "ON" : "OFF", true);   // retained
@@ -222,9 +235,11 @@ void publishFast(bool motion, bool button, int light) {
     s_last_light = light;
   }
 
+  // После первой отгрузки флага «новая сессия» больше нет
   s_connected_session = false;
 }
 
+// Температура — по изменению/таймауту
 void publishTemp(double tC) {
   if (!s_mqtt || !s_mqtt->connected()) return;
 
@@ -243,4 +258,4 @@ void publishTemp(double tC) {
   }
 }
 
-} // namespace
+} // namespace mqtt_ha
