@@ -49,8 +49,9 @@ void begin(ESP8266WebServer& server, DNSServer& dns, AppConfig& /*cfg*/) {
   if (WiFi.status() == WL_CONNECTED) {
     s_last_wifi_ok = millis();
   } else {
-    // если стартуем без связи — дадим 20s «окна» до поднятия AP
-    s_last_wifi_ok = millis();
+    // если стартуем без связи — начинаем отсчет оффлайна с 0
+    // это позволит корректно отсчитывать время до поднятия AP
+    s_last_wifi_ok = 0;
   }
 }
 
@@ -116,12 +117,22 @@ void ensureWifi(AppConfig& cfg) {
   static unsigned long s_last_try_ms = 0;
   if (cfg.wifi_ssid.length() && (now - s_last_try_ms >= 2000)) {
     // повторная попытка с теми же кредами
-    WiFi.mode(WIFI_STA);
+    // Важно: при попытке переподключения убеждаемся, что режим STA активен
+    if (s_ap_mode) {
+      // Если AP уже поднят, работаем в режиме AP_STA для продолжения попыток подключения
+      WiFi.mode(WIFI_AP_STA);
+    } else {
+      WiFi.mode(WIFI_STA);
+    }
     WiFi.begin(cfg.wifi_ssid.c_str(), cfg.wifi_pass.c_str());
     s_last_try_ms = now;
   }
 
-  if (!s_ap_mode && (now - s_last_wifi_ok > START_AP_AFTER_OFFLINE_MS)) {
+  // Поднимаем AP если прошло достаточно времени оффлайна
+  // Проверяем либо если s_last_wifi_ok == 0 (никогда не было подключения),
+  // либо если прошло достаточно времени с последнего успешного подключения
+  if (!s_ap_mode && ((s_last_wifi_ok == 0 && now > START_AP_AFTER_OFFLINE_MS) || 
+                      (s_last_wifi_ok > 0 && now - s_last_wifi_ok > START_AP_AFTER_OFFLINE_MS))) {
     startAPMode();
   }
 
